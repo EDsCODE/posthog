@@ -13,6 +13,7 @@ from typing import List, Tuple, Optional, Any, Union, Dict
 from django.db import transaction
 from sentry_sdk import capture_exception
 from dateutil.relativedelta import relativedelta
+from joinfield.joinfield import JoinField
 
 import secrets
 import re
@@ -183,7 +184,7 @@ class EventManager(models.QuerySet):
             PersonDistinctId.objects.filter(team_id=action.team_id, distinct_id=OuterRef('distinct_id')).order_by().values('person_id')[:1]
         ))
 
-    def filter_by_action(self, action, order_by='-id') -> models.QuerySet:
+    def query_db_by_action(self, action, order_by='-id') -> models.QuerySet:
         events = self
         any_step = Q()
         for step in action.steps.all():
@@ -202,11 +203,22 @@ class EventManager(models.QuerySet):
 
         return events
 
+    def filter_by_action(self, action, order_by='-id') -> models.QuerySet:
+        events = self.filter(action=action)\
+            .add_person_id(action)
+        if order_by:
+            events = events.order_by(order_by)
+        return events
+
     def create(self, *args: Any, **kwargs: Any):
         with transaction.atomic():
             if kwargs.get('elements'):
                 kwargs['elements_hash'] = ElementGroup.objects.create(team=kwargs['team'], elements=kwargs.pop('elements')).hash
-            return super().create(*args, **kwargs)
+            event = super().create(*args, **kwargs)
+            for action in event.actions:
+                action.events.add(event)
+                action.save()
+            return event
 
 
 class Event(models.Model):
@@ -217,6 +229,20 @@ class Event(models.Model):
     def person(self):
         return Person.objects.get(team_id=self.team_id, persondistinctid__distinct_id=self.distinct_id)
 
+    @property
+    def actions(self) -> List:
+        actions = Action.objects.filter(team_id=self.team_id)
+        events = Event.objects.filter(pk=self.pk)
+        for action in actions:
+            events = events.annotate(**{'action_{}'.format(action.pk): Event.objects\
+                .query_db_by_action(action)\
+                .filter(pk=self.pk)\
+                .values('id')[:1]
+            })
+        event = [event for event in events][0]
+
+        return [action for action in actions if getattr(event, 'action_{}'.format(action.pk))]
+
     objects: EventManager = EventManager.as_manager() # type: ignore
     team: models.ForeignKey = models.ForeignKey(Team, on_delete=models.CASCADE)
     event: models.CharField = models.CharField(max_length=200, null=True, blank=True)
@@ -226,6 +252,7 @@ class Event(models.Model):
     timestamp: models.DateTimeField = models.DateTimeField(default=timezone.now, blank=True)
     ip: models.GenericIPAddressField = models.GenericIPAddressField(null=True, blank=True)
     elements_hash: models.CharField = models.CharField(max_length=200, null=True, blank=True)
+    persondistinctid = JoinField('PersonDistinctId', to_field='distinct_id')
 
 class PersonManager(models.Manager):
     def create(self, *args: Any, **kwargs: Any):
@@ -265,6 +292,7 @@ class PersonDistinctId(models.Model):
     team: models.ForeignKey = models.ForeignKey(Team, on_delete=models.CASCADE)
     person: models.ForeignKey = models.ForeignKey(Person, on_delete=models.CASCADE)
     distinct_id: models.CharField = models.CharField(max_length=400)
+    
 
 class ElementGroupManager(models.Manager):
     def _hash_elements(self, elements: List) -> str:
@@ -317,15 +345,25 @@ class Element(models.Model):
     order: models.IntegerField = models.IntegerField(null=True, blank=True)
     group: models.ForeignKey = models.ForeignKey(ElementGroup, on_delete=models.CASCADE, null=True, blank=True)
 
+
 class Action(models.Model):
     name: models.CharField = models.CharField(max_length=400, null=True, blank=True)
     team: models.ForeignKey = models.ForeignKey(Team, on_delete=models.CASCADE)
     created_at: models.DateTimeField = models.DateTimeField(auto_now_add=True, blank=True)
     created_by: models.ForeignKey = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
     deleted: models.BooleanField = models.BooleanField(default=False)
+    events: models.ManyToManyField = models.ManyToManyField(Event, blank=True)
 
     def __str__(self):
         return self.name
+
+class ActionStepManager(models.Manager):
+    def create(self, *args: Any, **kwargs: Any):
+        action = kwargs['action']
+        action_step = super().create(*args, **kwargs)
+        events = Event.objects.query_db_by_action(action)
+        action.events.set(events)
+        return action_step
 
 class ActionStep(models.Model):
     EXACT = 'exact'
@@ -343,6 +381,7 @@ class ActionStep(models.Model):
     url_matching: models.CharField = models.CharField(max_length=400, choices=URL_MATCHING, default=CONTAINS)
     name: models.CharField = models.CharField(max_length=400, null=True, blank=True)
     event: models.CharField = models.CharField(max_length=400, null=True, blank=True)
+    objects: models.Manager = ActionStepManager()
 
 class Funnel(models.Model):
     name: models.CharField = models.CharField(max_length=400, null=True, blank=True)
